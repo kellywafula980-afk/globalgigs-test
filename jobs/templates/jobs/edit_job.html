@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Edit Job - GlobalGigs</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-black text-zinc-100 min-h-screen">
+    
+    <header class="border-b border-zinc-800 bg-zinc-950/50 backdrop-blur sticky top-0 z-50">
+        <div class="max-w-5xl mx-auto px-4 h-16 flex items-center justify-between">
+            <a href="/" class="flex items-center gap-2 font-black text-2xl text-white">
+                <span class="text-emerald-500">💼</span> GLOBAL<span class="text-emerald-400">GIGS</span>
+            </a>
+            <div class="flex items-center gap-4">
+                <a href="{% url 'dashboard' %}" class="text-sm text-zinc-400 hover:text-white transition">← Dashboard</a>
+                <a href="{% url 'logout' %}" class="text-sm text-red-400 hover:text-red-300 transition">Logout</a>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-2xl mx-auto px-4 py-8">
+        <h2 class="text-3xl font-black text-white mb-6">✏️ Edit Job: {{ job.title }}</h2>
+        
+        <form method="POST" class="space-y-4 bg-zinc-900/60 border border-zinc-800 rounded-2xl p-8">
+            {% csrf_token %}
+            
+            <div>
+                <label class="block text-zinc-400 text-sm font-medium mb-1">Job Title *</label>
+                {{ edit_job_form.title }}
+                {% if edit_job_form.title.errors %}
+                    <p class="text-red-400 text-sm mt-1">{{ edit_job_form.title.errors.0 }}</p>
+                {% endif %}
+            </div>
+            
+            <div>
+                <label class="block text-zinc-400 text-sm font-medium mb-1">Company Name *</label>
+                {{ edit_job_form.company_name }}
+                {% if edit_job_form.company_name.errors %}
+                    <p class="text-red-400 text-sm mt-1">{{ edit_job_form.company_name.errors.0 }}</p>
+                {% endif %}
+            </div>
+            
+            <div>
+                <label class="block text-zinc-400 text-sm font-medium mb-1">Description *</label>
+                {{ edit_job_form.description }}
+                {% if edit_job_form.description.errors %}
+                    <p class="text-red-400 text-sm mt-1">{{ edit_job_form.description.errors.0 }}</p>
+                {% endif %}
+            </div>
+            
+            <div>
+                <label class="block text-zinc-400 text-sm font-medium mb-1">Location *</label>
+                {{ edit_job_form.location }}
+                {% if edit_job_form.location.errors %}
+                    <p class="text-red-400 text-sm mt-1">{{ edit_job_form.location.errors.0 }}</p>
+                {% endif %}
+            </div>
+            
+            <div>
+                <label class="block text-zinc-400 text-sm font-medium mb-1">Salary Range</label>
+                {{ edit_job_form.salary_range }}
+                {% if edit_job_form.salary_range.errors %}
+                    <p class="text-red-400 text-sm mt-1">{{ edit_job_form.salary_range.errors.0 }}</p>
+                {% endif %}
+            </div>
+            
+            <div>
+                <label class="block text-zinc-400 text-sm font-medium mb-1">Email to Receive Applications *</label>
+                {{ edit_job_form.email_to_receive_applications }}
+                {% if edit_job_form.email_to_receive_applications.errors %}
+                    <p class="text-red-400 text-sm mt-1">{{ edit_job_form.email_to_receive_applications.errors.0 }}</p>
+                {% endif %}
+            </div>
+            
+            <div>
+                <label class="block text-zinc-400 text-sm font-medium mb-1">Category</label>
+                {{ edit_job_form.category }}
+            </div>
+            
+            <div>
+                <label class="block text-zinc-400 text-sm font-medium mb-1">Status</label>
+                {{ edit_job_form.status }}
+            </div>
+            
+            <div>
+                <label class="block text-zinc-400 text-sm font-medium mb-1">Expires At</label>
+                {{ edit_job_form.expires_at }}
+            </div>
+            
+            <div>
+                <label class="block text-zinc-400 text-sm font-medium mb-1">Apply URL</label>
+                {{ edit_job_form.apply_url }}
+            </div>
+            
+            <button type="submit" class="w-full px-6 py-3 bg-emerald-500 hover:bg-emerald-600 text-black font-bold rounded-xl transition shadow-lg shadow-emerald-500/20">
+                💾 Update Job
+            </button>
+        </form>
+    </main>
+</body>
+</html>

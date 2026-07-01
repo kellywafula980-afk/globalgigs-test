@@ -1,0 +1,997 @@
+from django.shortcuts import render, get_object_or_404, redirect
+from django.db.models import Q, Count
+from django.http import HttpResponse
+from django.contrib import messages
+from django.contrib.auth import login, authenticate, logout
+from django.contrib.auth.decorators import login_required
+from django.urls import reverse
+from django.conf import settings
+from django.core.management import call_command
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
+from django.utils import timezone
+from django.core.mail import send_mail
+
+from .models import (
+    JobListing, JobApplication, JobCategory,
+    UserProfile, EmployerJob, EmployerJobApplication
+)
+from .forms import (
+    JobApplicationForm, JobPostForm,
+    CustomUserCreationForm, UserProfileForm, 
+    EmployerJobForm, EmployerJobApplicationForm
+)
+from .scraper import scale_database_to_thousands, parse_job_sections
+import requests
+import json
+
+
+# ============================================================
+# AUTHENTICATION VIEWS
+# ============================================================
+
+def signup(request):
+    """Employer signup page"""
+    if request.user.is_authenticated:
+        return redirect('dashboard')
+    
+    if request.method == 'POST':
+        signup_form = CustomUserCreationForm(request.POST)
+        if signup_form.is_valid():
+            user = signup_form.save()
+            login(request, user)
+            messages.success(request, f'🎉 Welcome {user.username}! You can now post jobs.')
+            return redirect('dashboard')
+    else:
+        signup_form = CustomUserCreationForm()
+    
+    return render(request, 'jobs/signup.html', {'signup_form': signup_form})
+
+
+def login_view(request):
+    """Employer login page"""
+    if request.user.is_authenticated:
+        return redirect('dashboard')
+    
+    if request.method == 'POST':
+        username = request.POST.get('username')
+        password = request.POST.get('password')
+        user = authenticate(request, username=username, password=password)
+        if user is not None:
+            login(request, user)
+            messages.success(request, f'👋 Welcome back, {user.username}!')
+            return redirect('dashboard')
+        else:
+            messages.error(request, '❌ Invalid username or password.')
+    
+    return render(request, 'jobs/login.html')
+
+
+
+# ============================================================
+# EMPLOYER DASHBOARD & JOB MANAGEMENT (FIXED)
+# ============================================================
+
+@login_required
+def dashboard(request):
+    """Employer dashboard showing all posted jobs and stats"""
+    user = request.user
+    
+    # Handle UserProfile creation properly
+    try:
+        profile = UserProfile.objects.get(user=user)
+    except UserProfile.DoesNotExist:
+        # Create a profile if it doesn't exist
+        profile = UserProfile.objects.create(
+            user=user,
+            company_name=user.username + "'s Company"
+        )
+    
+    # Get jobs posted by this employer
+    jobs = EmployerJob.objects.filter(employer=user).order_by('-created_at')
+    
+    # Stats with safe defaults
+    total_jobs = jobs.count()
+    active_jobs = jobs.filter(status='active').count()
+    paused_jobs = jobs.filter(status='paused').count()
+    filled_jobs = jobs.filter(status='filled').count()
+    expired_jobs = jobs.filter(status='expired').count()
+    total_applications = sum(job.applications_count or 0 for job in jobs)
+    
+    # Recent applications with safe handling
+    recent_applications = []
+    if EmployerJobApplication.objects.filter(job__employer=user).exists():
+        recent_applications = EmployerJobApplication.objects.filter(
+            job__employer=user
+        ).order_by('-applied_at')[:10]
+    
+    context = {
+        'profile': profile,
+        'jobs': jobs,
+        'total_jobs': total_jobs,
+        'active_jobs': active_jobs,
+        'paused_jobs': paused_jobs,
+        'filled_jobs': filled_jobs,
+        'expired_jobs': expired_jobs,
+        'total_applications': total_applications,
+        'recent_applications': recent_applications,
+    }
+    return render(request, 'jobs/dashboard.html', context)
+
+
+@login_required
+def post_job(request):
+    """Post a new job as an employer"""
+    if request.method == 'POST':
+        post_job_form = EmployerJobForm(request.POST)
+        if post_job_form.is_valid():
+            job = post_job_form.save(commit=False)
+            job.employer = request.user
+            # Use company name from profile if not provided
+            try:
+                if not job.company_name and request.user.userprofile.company_name:
+                    job.company_name = request.user.userprofile.company_name
+            except UserProfile.DoesNotExist:
+                pass
+            job.save()
+            messages.success(request, f'✅ Your job "{job.title}" has been posted successfully!')
+            return redirect('dashboard')
+    else:
+        post_job_form = EmployerJobForm()
+        # Pre-fill with user's company name
+        try:
+            if request.user.userprofile.company_name:
+                post_job_form.fields['company_name'].initial = request.user.userprofile.company_name
+        except UserProfile.DoesNotExist:
+            pass
+    
+    return render(request, 'jobs/post_job.html', {
+        'post_job_form': post_job_form,
+        'categories': JobCategory.objects.all()
+    })
+
+
+@login_required
+def edit_job(request, job_id):
+    """Edit an existing employer job"""
+    job = get_object_or_404(EmployerJob, id=job_id, employer=request.user)
+    
+    if request.method == 'POST':
+        edit_job_form = EmployerJobForm(request.POST, instance=job)
+        if edit_job_form.is_valid():
+            edit_job_form.save()
+            messages.success(request, f'✅ Job "{job.title}" updated successfully!')
+            return redirect('dashboard')
+    else:
+        edit_job_form = EmployerJobForm(instance=job)
+    
+    return render(request, 'jobs/edit_job.html', {
+        'edit_job_form': edit_job_form,
+        'job': job,
+        'categories': JobCategory.objects.all()
+    })
+
+
+@login_required
+def delete_job(request, job_id):
+    """Delete an employer job"""
+    job = get_object_or_404(EmployerJob, id=job_id, employer=request.user)
+    
+    if request.method == 'POST':
+        job_title = job.title
+        job.delete()
+        messages.success(request, f'✅ Job "{job_title}" deleted successfully.')
+        return redirect('dashboard')
+    
+    return render(request, 'jobs/delete_job.html', {'job': job})
+
+
+@login_required
+def toggle_job_status(request, job_id):
+    """Toggle job status between active and paused"""
+    job = get_object_or_404(EmployerJob, id=job_id, employer=request.user)
+    
+    if request.method == 'POST':
+        new_status = request.POST.get('status')
+        if new_status in dict(EmployerJob.STATUS_CHOICES):
+            job.status = new_status
+            job.save()
+            messages.success(request, f'✅ Job status updated to {job.get_status_display()}')
+        else:
+            messages.error(request, '❌ Invalid status')
+    
+    return redirect('dashboard')
+
+
+@login_required
+def job_applications(request, job_id):
+    """View all applications for a specific employer job"""
+    job = get_object_or_404(EmployerJob, id=job_id, employer=request.user)
+    applications = EmployerJobApplication.objects.filter(job=job).order_by('-applied_at')
+    
+    # Stats for this job
+    total_apps = applications.count()
+    pending = applications.filter(status='pending').count()
+    reviewed = applications.filter(status='reviewed').count()
+    shortlisted = applications.filter(status='shortlisted').count()
+    rejected = applications.filter(status='rejected').count()
+    hired = applications.filter(status='hired').count()
+    
+    context = {
+        'job': job,
+        'applications': applications,
+        'total_apps': total_apps,
+        'pending': pending,
+        'reviewed': reviewed,
+        'shortlisted': shortlisted,
+        'rejected': rejected,
+        'hired': hired,
+    }
+    return render(request, 'jobs/job_applications.html', context)
+
+
+@login_required
+def update_application_status(request, application_id):
+    """Update application status"""
+    application = get_object_or_404(EmployerJobApplication, id=application_id)
+    
+    if application.job.employer != request.user:
+        messages.error(request, '❌ You do not have permission to update this application.')
+        return redirect('dashboard')
+    
+    if request.method == 'POST':
+        status = request.POST.get('status')
+        if status in dict(EmployerJobApplication.STATUS_CHOICES):
+            application.status = status
+            application.save()
+            messages.success(request, f'✅ Application status updated to {application.get_status_display()}')
+        else:
+            messages.error(request, '❌ Invalid status')
+    
+    return redirect('job_applications', job_id=application.job.id)
+
+
+@login_required
+def view_application_detail(request, application_id):
+    """View detailed application information"""
+    application = get_object_or_404(EmployerJobApplication, id=application_id)
+    
+    if application.job.employer != request.user:
+        messages.error(request, '❌ You do not have permission to view this application.')
+        return redirect('dashboard')
+    
+    return render(request, 'jobs/application_detail.html', {'application': application})
+
+
+# ============================================================
+# PROFILE VIEWS
+# ============================================================
+
+@login_required
+def profile(request):
+    """View and edit employer profile"""
+    try:
+        profile = UserProfile.objects.get(user=request.user)
+    except UserProfile.DoesNotExist:
+        profile = UserProfile.objects.create(
+            user=request.user,
+            company_name=request.user.username + "'s Company"
+        )
+    
+    if request.method == 'POST':
+        profile_form = UserProfileForm(request.POST, request.FILES, instance=profile)
+        if profile_form.is_valid():
+            profile_form.save()
+            messages.success(request, '✅ Profile updated successfully!')
+            return redirect('profile')
+    else:
+        profile_form = UserProfileForm(instance=profile)
+    
+    return render(request, 'jobs/profile.html', {
+        'profile_form': profile_form,
+        'profile': profile
+    })
+
+
+# ============================================================
+# HOMEPAGE & JOB LISTINGS
+# ============================================================
+
+def job_list_view(request):
+    """Renders the live job stream with search and category filters"""
+    query = request.GET.get('search', '').strip()
+    category_slug = request.GET.get('category', '')
+    
+    jobs = JobListing.objects.all().order_by('-id')
+    
+    if category_slug:
+        try:
+            category = JobCategory.objects.get(slug=category_slug)
+            jobs = jobs.filter(category=category)
+        except JobCategory.DoesNotExist:
+            jobs = JobListing.objects.none()
+    
+    if query:
+        jobs = jobs.filter(
+            Q(title__icontains=query) | 
+            Q(company_name__icontains=query) |
+            Q(location__icontains=query)
+        )
+    
+    categories = JobCategory.objects.all()
+    
+    context = {
+        'jobs': jobs,
+        'search_query': query,
+        'categories': categories,
+        'current_category': category_slug,
+    }
+    
+    return render(request, 'jobs/home.html', context)
+
+
+homepage_job_board = job_list_view
+content_batcher_dashboard = job_list_view
+
+
+# ============================================================
+# JOB DETAIL & APPLICATIONS
+# ============================================================
+
+def job_detail_view(request, job_id):
+    """Display a single job listing with application form"""
+    job = get_object_or_404(JobListing, id=job_id)
+    
+    if not job.responsibilities and job.description:
+        try:
+            parsed, clean_desc = parse_job_sections(job.description)
+            if parsed:
+                job.responsibilities = parsed.get('responsibilities', '')
+                job.requirements = parsed.get('requirements', '')
+                job.benefits = parsed.get('benefits', '')
+                job.company_description = parsed.get('about_company', '')
+                job.save()
+        except Exception as e:
+            print(f"⚠️ Error parsing job {job.id}: {e}")
+    
+    related_jobs = JobListing.objects.filter(
+        category=job.category
+    ).exclude(id=job.id)[:6] if job.category else []
+    
+    if not related_jobs and job.title:
+        title_words = job.title.split()[:3]
+        if title_words:
+            related_jobs = JobListing.objects.filter(
+                Q(title__icontains=title_words[0]) |
+                Q(company_name__icontains=job.company_name[:20])
+            ).exclude(id=job.id)[:6]
+    
+    if request.method == 'POST':
+        if 'full_name' in request.POST and 'email' in request.POST:
+            application_form = JobApplicationForm(request.POST, request.FILES)
+            if application_form.is_valid():
+                application = application_form.save(commit=False)
+                application.job = job
+                application.save()
+                messages.success(request, f'✅ Your application for {job.title} has been submitted successfully!')
+                return redirect('job_detail', job_id=job.id)
+            else:
+                messages.error(request, '❌ Please correct the errors below.')
+        elif 'username' in request.POST and 'password' in request.POST:
+            username = request.POST.get('username')
+            password = request.POST.get('password')
+            user = authenticate(request, username=username, password=password)
+            if user is not None:
+                login(request, user)
+                messages.success(request, f'👋 Welcome back, {user.username}!')
+                return redirect('job_detail', job_id=job.id)
+            else:
+                messages.error(request, '❌ Invalid username or password.')
+    
+    application_form = JobApplicationForm()
+    
+    context = {
+        'job': job,
+        'related_jobs': related_jobs,
+        'application_form': application_form,
+    }
+    return render(request, 'jobs/job_detail.html', context)
+
+
+def employer_job_detail(request, job_id):
+    """Display a job posted by an employer with application form"""
+    job = get_object_or_404(EmployerJob, id=job_id)
+    
+    job.views_count += 1
+    job.save()
+    
+    if request.method == 'POST':
+        employer_app_form = EmployerJobApplicationForm(request.POST, request.FILES)
+        if employer_app_form.is_valid():
+            application = employer_app_form.save(commit=False)
+            application.job = job
+            application.save()
+            job.applications_count += 1
+            job.save()
+            messages.success(request, f'✅ Your application for {job.title} has been submitted successfully!')
+            return redirect('employer_job_detail', job_id=job.id)
+        else:
+            messages.error(request, '❌ Please correct the errors below.')
+    else:
+        employer_app_form = EmployerJobApplicationForm()
+    
+    related_jobs = EmployerJob.objects.filter(
+        category=job.category
+    ).exclude(id=job.id)[:6] if job.category else []
+    
+    context = {
+        'job': job,
+        'employer_app_form': employer_app_form,
+        'related_jobs': related_jobs,
+        'is_employer_job': True,
+    }
+    return render(request, 'jobs/employer_job_detail.html', context)
+
+
+# ============================================================
+# SCRAPER & DEBUG
+# ============================================================
+
+def secret_trigger_scraper(request):
+    """Secure endpoint to populate the live production database"""
+    key = request.GET.get('key')
+    if key != 'candy2026':
+        return HttpResponse("Unauthorized access.", status=403)
+        
+    try:
+        result = scale_database_to_thousands()
+        return HttpResponse(f"🚀 {result}", status=200)
+    except Exception as e:
+        return HttpResponse(f"⚠️ Error running scraper: {str(e)}", status=500)
+
+
+def debug_jobs(request):
+    """Shows how many jobs are in the database"""
+    count = JobListing.objects.count()
+    first_job = JobListing.objects.first()
+    
+    output = f"""
+    <h1>Database Debug</h1>
+    <p>Total JobListing objects: <strong>{count}</strong></p>
+    """
+    
+    if first_job:
+        output += f"""
+        <h2>First Job:</h2>
+        <ul>
+            <li>ID: {first_job.id}</li>
+            <li>Title: {first_job.title}</li>
+            <li>Company: {first_job.company_name}</li>
+            <li>Created: {first_job.created_at}</li>
+            <li>Has Responsibilities: {bool(first_job.responsibilities)}</li>
+            <li>Has Requirements: {bool(first_job.requirements)}</li>
+        </ul>
+        """
+    else:
+        output += "<p>⚠️ No jobs found in JobListing table!</p>"
+    
+    return HttpResponse(output)
+
+
+def category_debug(request):
+    """Debug view to check categories and jobs"""
+    output = "<h1>Category Debug</h1>"
+    
+    categories = JobCategory.objects.all()
+    output += f"<p>Total categories: {categories.count()}</p>"
+    
+    for cat in categories:
+        job_count = cat.jobs.count()
+        output += f"<p><strong>{cat.icon} {cat.name}</strong>: {job_count} jobs</p>"
+        if job_count > 0:
+            output += "<ul>"
+            for job in cat.jobs.all()[:5]:
+                output += f"<li>{job.title}</li>"
+            if job_count > 5:
+                output += f"<li>... and {job_count - 5} more</li>"
+            output += "</ul>"
+    
+    return HttpResponse(output)
+
+
+# ============================================================
+# SITEMAP & ROBOTS
+# ============================================================
+
+def generate_sitemap(request):
+    """Dynamic sitemap"""
+    jobs = JobListing.objects.all()
+    
+    xml = '<?xml version="1.0" encoding="UTF-8"?>\n'
+    xml += '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+    
+    xml += f'''<url>
+    <loc>https://globalgigs-0096.onrender.com/</loc>
+    <lastmod>{jobs.first().created_at.strftime("%Y-%m-%d") if jobs.exists() else "2026-01-01"}</lastmod>
+    <changefreq>daily</changefreq>
+    <priority>1.0</priority>
+</url>\n'''
+    
+    for job in jobs:
+        xml += f'''<url>
+    <loc>https://globalgigs-0096.onrender.com/jobs/{job.id}/</loc>
+    <lastmod>{job.created_at.strftime("%Y-%m-%d")}</lastmod>
+    <changefreq>daily</changefreq>
+    <priority>0.8</priority>
+</url>\n'''
+    
+    xml += '</urlset>'
+    return HttpResponse(xml, content_type='application/xml')
+
+
+def robots_txt(request):
+    content = """User-agent: *
+Allow: /
+
+Sitemap: https://globalgigs-0096.onrender.com/sitemap.xml"""
+    return HttpResponse(content, content_type='text/plain')
+
+
+# ============================================================
+# ENRICH & UTILITY
+# ============================================================
+
+def enrich_jobs_endpoint(request):
+    """Endpoint to enrich all jobs with structured content"""
+    key = request.GET.get('key')
+    if key != 'candy2026':
+        return HttpResponse("Unauthorized", status=403)
+    
+    jobs = JobListing.objects.all()
+    count = 0
+    errors = 0
+    
+    for job in jobs:
+        if job.description:
+            try:
+                parsed, clean_desc = parse_job_sections(job.description)
+                if parsed:
+                    job.responsibilities = parsed.get('responsibilities', '')
+                    job.requirements = parsed.get('requirements', '')
+                    job.benefits = parsed.get('benefits', '')
+                    job.company_description = parsed.get('about_company', '')
+                    job.save()
+                    count += 1
+            except Exception as e:
+                errors += 1
+    
+    return HttpResponse(f"✅ Enriched {count} jobs. Errors: {errors}")
+
+
+def run_migrations(request):
+    """Run migrations via URL"""
+    key = request.GET.get('key')
+    if key != 'candy2026':
+        return HttpResponse("Unauthorized", status=403)
+    
+    try:
+        call_command('migrate')
+        return HttpResponse("✅ Migrations completed successfully!")
+    except Exception as e:
+        return HttpResponse(f"❌ Error: {str(e)}", status=500)
+
+
+def create_categories_production(request):
+    """Create categories on production database"""
+    key = request.GET.get('key')
+    if key != 'candy2026':
+        return HttpResponse("Unauthorized", status=403)
+    
+    categories = [
+        ('Technology', 'technology', '💻'),
+        ('Marketing', 'marketing', '📊'),
+        ('Sales', 'sales', '🤝'),
+        ('Healthcare', 'healthcare', '🏥'),
+        ('Finance', 'finance', '💰'),
+        ('Education', 'education', '📚'),
+        ('Administrative', 'administrative', '📋'),
+        ('Customer Service', 'customer-service', '🎧'),
+        ('Design', 'design', '🎨'),
+        ('Engineering', 'engineering', '🔧'),
+        ('HR', 'hr', '👥'),
+        ('Legal', 'legal', '⚖️'),
+        ('Operations', 'operations', '📦'),
+        ('Data', 'data', '📊'),
+        ('Product', 'product', '📱'),
+        ('Writing', 'writing', '✍️'),
+        ('Consulting', 'consulting', '💡'),
+        ('Real Estate', 'real-estate', '🏠'),
+        ('Media', 'media', '🎬'),
+    ]
+    
+    created = 0
+    for name, slug, icon in categories:
+        obj, is_new = JobCategory.objects.get_or_create(name=name, slug=slug, icon=icon)
+        if is_new:
+            created += 1
+    
+    return HttpResponse(f"✅ Created {created} new categories. Total: {JobCategory.objects.count()}")
+
+
+def categorize_jobs_production(request):
+    """Categorize jobs on production database"""
+    key = request.GET.get('key')
+    if key != 'candy2026':
+        return HttpResponse("Unauthorized", status=403)
+    
+    from .categorizer import auto_categorize_jobs
+    count = auto_categorize_jobs()
+    return HttpResponse(f"✅ Categorized {count} jobs on production")
+
+
+def force_assign_categories(request):
+    """Force assign categories to all jobs"""
+    key = request.GET.get('key')
+    if key != 'candy2026':
+        return HttpResponse("Unauthorized", status=403)
+    
+    from .models import JobListing, JobCategory
+    import re
+    
+    keywords = {
+        'Technology': ['software', 'developer', 'engineer', 'programming', 'code', 'it', 'tech', 'cloud', 'data', 'ai', 'python', 'java', 'javascript', 'react', 'django', 'fullstack', 'backend', 'frontend', 'devops'],
+        'Marketing': ['marketing', 'seo', 'social media', 'content', 'brand', 'digital marketing', 'ppc', 'advertising', 'growth', 'campaign'],
+        'Sales': ['sales', 'account executive', 'business development', 'sales rep', 'sales manager', 'account manager', 'inside sales', 'bd'],
+        'Healthcare': ['health', 'medical', 'doctor', 'nurse', 'clinical', 'patient', 'care', 'healthcare', 'pharmacy', 'wellness'],
+        'Finance': ['finance', 'accountant', 'financial', 'banking', 'investment', 'tax', 'audit', 'controller', 'treasury'],
+        'Education': ['teacher', 'education', 'training', 'instructor', 'curriculum', 'academic', 'tutor', 'professor'],
+        'Administrative': ['administrative', 'assistant', 'office', 'coordinator', 'receptionist', 'admin', 'executive assistant'],
+        'Customer Service': ['customer service', 'support', 'customer success', 'help desk', 'call center', 'client service'],
+        'Design': ['designer', 'design', 'ui', 'ux', 'graphic', 'creative', 'visual', 'artist'],
+        'Engineering': ['mechanical', 'electrical', 'civil', 'construction', 'architect', 'structural', 'project engineer'],
+        'HR': ['human resources', 'hr', 'recruitment', 'recruiter', 'talent', 'people operations', 'hiring'],
+        'Legal': ['legal', 'law', 'attorney', 'paralegal', 'compliance', 'regulatory', 'contract'],
+        'Operations': ['operations', 'supply chain', 'logistics', 'procurement', 'inventory', 'warehouse'],
+        'Data': ['data scientist', 'data analyst', 'data engineer', 'business intelligence', 'analytics'],
+        'Product': ['product manager', 'product owner', 'product management', 'product development'],
+        'Writing': ['writer', 'editor', 'content', 'copywriter', 'journalist', 'author'],
+        'Consulting': ['consultant', 'consulting', 'advisory', 'strategy', 'management consulting'],
+        'Real Estate': ['real estate', 'property', 'realtor', 'broker', 'property management'],
+        'Media': ['media', 'video', 'content creator', 'influencer', 'broadcast', 'production'],
+    }
+    
+    category_map = {cat.name.lower(): cat for cat in JobCategory.objects.all()}
+    jobs = JobListing.objects.filter(category__isnull=True)
+    total = jobs.count()
+    categorized = 0
+    
+    for job in jobs:
+        text = f"{job.title} {job.description}".lower()
+        
+        best_cat = None
+        best_score = 0
+        
+        for cat_name, cat_keywords in keywords.items():
+            score = sum(1 for kw in cat_keywords if kw in text)
+            if score > best_score:
+                best_score = score
+                best_cat = category_map.get(cat_name.lower())
+        
+        if best_cat and best_score >= 2:
+            job.category = best_cat
+            job.save()
+            categorized += 1
+    
+    return HttpResponse(f"✅ Categorized {categorized} out of {total} jobs")
+
+
+def simple_categorize(request):
+    """Simple categorization for production"""
+    key = request.GET.get('key')
+    if key != 'candy2026':
+        return HttpResponse("Unauthorized", status=403)
+    
+    from .models import JobListing, JobCategory
+    
+    categories = JobCategory.objects.all()
+    category_map = {cat.name.lower(): cat for cat in categories}
+    
+    keywords = {
+        'Technology': ['software', 'developer', 'engineer', 'programming', 'code', 'it', 'tech', 'cloud', 'data', 'ai', 'python', 'java', 'javascript', 'react', 'django', 'fullstack', 'backend', 'frontend', 'devops'],
+        'Marketing': ['marketing', 'seo', 'social media', 'content', 'brand', 'digital marketing', 'ppc', 'advertising', 'growth', 'campaign'],
+        'Sales': ['sales', 'account executive', 'business development', 'sales rep', 'sales manager', 'account manager', 'inside sales', 'bd'],
+        'Healthcare': ['health', 'medical', 'doctor', 'nurse', 'clinical', 'patient', 'care', 'healthcare', 'pharmacy', 'wellness'],
+        'Finance': ['finance', 'accountant', 'financial', 'banking', 'investment', 'tax', 'audit', 'controller', 'treasury'],
+        'Education': ['teacher', 'education', 'training', 'instructor', 'curriculum', 'academic', 'tutor', 'professor'],
+        'Administrative': ['administrative', 'assistant', 'office', 'coordinator', 'receptionist', 'admin', 'executive assistant'],
+        'Customer Service': ['customer service', 'support', 'customer success', 'help desk', 'call center', 'client service'],
+        'Design': ['designer', 'design', 'ui', 'ux', 'graphic', 'creative', 'visual', 'artist'],
+        'Engineering': ['mechanical', 'electrical', 'civil', 'construction', 'architect', 'structural', 'project engineer'],
+        'HR': ['human resources', 'hr', 'recruitment', 'recruiter', 'talent', 'people operations', 'hiring'],
+        'Legal': ['legal', 'law', 'attorney', 'paralegal', 'compliance', 'regulatory', 'contract'],
+        'Operations': ['operations', 'supply chain', 'logistics', 'procurement', 'inventory', 'warehouse'],
+        'Data': ['data scientist', 'data analyst', 'data engineer', 'business intelligence', 'analytics'],
+        'Product': ['product manager', 'product owner', 'product management', 'product development'],
+        'Writing': ['writer', 'editor', 'content', 'copywriter', 'journalist', 'author'],
+        'Consulting': ['consultant', 'consulting', 'advisory', 'strategy', 'management consulting'],
+        'Real Estate': ['real estate', 'property', 'realtor', 'broker', 'property management'],
+        'Media': ['media', 'video', 'content creator', 'influencer', 'broadcast', 'production'],
+    }
+    
+    jobs = JobListing.objects.filter(category__isnull=True)
+    total = jobs.count()
+    categorized = 0
+    
+    for job in jobs:
+        text = f"{job.title} {job.description}".lower()
+        
+        best_cat = None
+        best_score = 0
+        
+        for cat_name, cat_keywords in keywords.items():
+            score = sum(1 for kw in cat_keywords if kw in text)
+            if score > best_score:
+                best_score = score
+                best_cat = category_map.get(cat_name.lower())
+        
+        if best_cat and best_score >= 2:
+            job.category = best_cat
+            job.save()
+            categorized += 1
+    
+    return HttpResponse(f"✅ Categorized {categorized} out of {total} jobs")
+
+# ============================================================
+# PAYMENT VIEWS (Added for Paystack integration)
+# ============================================================
+
+def post_job_page(request):
+    """Page where employers can post a job via Paystack"""
+    from .forms import JobPostForm
+    job_post_form = JobPostForm()
+    return render(request, 'jobs/post_job_paystack.html', {'job_post_form': job_post_form})
+
+def initiate_payment(request):
+    """Initialize Paystack payment"""
+    from .forms import JobPostForm
+    if request.method == 'POST':
+        form = JobPostForm(request.POST)
+        if form.is_valid():
+            request.session['pending_job'] = {
+                'title': form.cleaned_data['title'],
+                'company_name': form.cleaned_data['company_name'],
+                'description': form.cleaned_data['description'],
+                'location': form.cleaned_data['location'],
+                'salary_range': form.cleaned_data['salary_range'],
+            }
+            messages.info(request, 'Payment integration would go here.')
+            return redirect('dashboard')
+    return redirect('post_job')
+
+
+# ============================================================
+# LOGOUT VIEW
+# ============================================================
+
+def logout_view(request):
+    """Logout employer"""
+    from django.contrib.auth import logout
+    from django.shortcuts import redirect
+    logout(request)
+    return redirect('/')
+# ============================================================
+# PAYMENT VIEWS (Added for Paystack integration)
+# ============================================================
+
+def post_job_page(request):
+    """Page where employers can post a job via Paystack"""
+    from .forms import JobPostForm
+    job_post_form = JobPostForm()
+    return render(request, 'jobs/post_job_paystack.html', {'job_post_form': job_post_form})
+
+def initiate_payment(request):
+    """Initialize Paystack payment"""
+    from .forms import JobPostForm
+    if request.method == 'POST':
+        form = JobPostForm(request.POST)
+        if form.is_valid():
+            request.session['pending_job'] = {
+                'title': form.cleaned_data['title'],
+                'company_name': form.cleaned_data['company_name'],
+                'description': form.cleaned_data['description'],
+                'location': form.cleaned_data['location'],
+                'salary_range': form.cleaned_data['salary_range'],
+            }
+            messages.info(request, 'Payment integration would go here.')
+            return redirect('dashboard')
+    return redirect('post_job')
+
+def payment_callback(request):
+    """Handle payment callback"""
+    messages.info(request, 'Payment callback handled.')
+    return redirect('dashboard')
+
+@csrf_exempt
+@require_POST
+def paystack_webhook(request):
+    """Paystack webhook"""
+    return HttpResponse(status=200)
+
+
+# ============================================================
+# CATEGORIZE JOBS
+# ============================================================
+
+def categorize_jobs_production(request):
+    """Categorize jobs on production database"""
+    key = request.GET.get('key')
+    if key != 'candy2026':
+        return HttpResponse("Unauthorized", status=403)
+    
+    from .models import JobCategory
+    
+    categories = JobCategory.objects.all()
+    category_map = {cat.name.lower(): cat for cat in categories}
+    
+    keywords = {
+        'Technology': ['software', 'developer', 'engineer', 'programming', 'code', 'it', 'tech', 'cloud', 'data', 'ai', 'python', 'java', 'javascript', 'react', 'django', 'fullstack', 'backend', 'frontend', 'devops'],
+        'Marketing': ['marketing', 'seo', 'social media', 'content', 'brand', 'digital marketing', 'ppc', 'advertising', 'growth', 'campaign'],
+        'Sales': ['sales', 'account executive', 'business development', 'sales rep', 'sales manager', 'account manager', 'inside sales', 'bd'],
+        'Healthcare': ['health', 'medical', 'doctor', 'nurse', 'clinical', 'patient', 'care', 'healthcare', 'pharmacy', 'wellness'],
+        'Finance': ['finance', 'accountant', 'financial', 'banking', 'investment', 'tax', 'audit', 'controller', 'treasury'],
+        'Education': ['teacher', 'education', 'training', 'instructor', 'curriculum', 'academic', 'tutor', 'professor'],
+        'Administrative': ['administrative', 'assistant', 'office', 'coordinator', 'receptionist', 'admin', 'executive assistant'],
+        'Customer Service': ['customer service', 'support', 'customer success', 'help desk', 'call center', 'client service'],
+        'Design': ['designer', 'design', 'ui', 'ux', 'graphic', 'creative', 'visual', 'artist'],
+        'Engineering': ['mechanical', 'electrical', 'civil', 'construction', 'architect', 'structural', 'project engineer'],
+        'HR': ['human resources', 'hr', 'recruitment', 'recruiter', 'talent', 'people operations', 'hiring'],
+        'Legal': ['legal', 'law', 'attorney', 'paralegal', 'compliance', 'regulatory', 'contract'],
+        'Operations': ['operations', 'supply chain', 'logistics', 'procurement', 'inventory', 'warehouse'],
+        'Data': ['data scientist', 'data analyst', 'data engineer', 'business intelligence', 'analytics'],
+        'Product': ['product manager', 'product owner', 'product management', 'product development'],
+        'Writing': ['writer', 'editor', 'content', 'copywriter', 'journalist', 'author'],
+        'Consulting': ['consultant', 'consulting', 'advisory', 'strategy', 'management consulting'],
+        'Real Estate': ['real estate', 'property', 'realtor', 'broker', 'property management'],
+        'Media': ['media', 'video', 'content creator', 'influencer', 'broadcast', 'production'],
+    }
+    
+    jobs = JobListing.objects.filter(category__isnull=True)
+    total = jobs.count()
+    categorized = 0
+    
+    for job in jobs:
+        text = f"{job.title} {job.description}".lower()
+        
+        best_cat = None
+        best_score = 0
+        
+        for cat_name, cat_keywords in keywords.items():
+            score = sum(1 for kw in cat_keywords if kw in text)
+            if score > best_score:
+                best_score = score
+                best_cat = category_map.get(cat_name.lower())
+        
+        if best_cat and best_score >= 2:
+            job.category = best_cat
+            job.save()
+            categorized += 1
+    
+    return HttpResponse(f"✅ Categorized {categorized} out of {total} jobs")
+
+# ============================================================
+# PAYSTACK PAYMENT VIEWS
+# ============================================================
+
+def initiate_payment(request):
+    """Initialize Paystack payment for job posting"""
+    from .forms import JobPostForm
+    import requests
+    from django.urls import reverse
+    from django.conf import settings
+    
+    if request.method == 'POST':
+        form = JobPostForm(request.POST)
+        if form.is_valid():
+            # Store job data in session
+            request.session['pending_job'] = {
+                'title': form.cleaned_data['title'],
+                'company_name': form.cleaned_data['company_name'],
+                'description': form.cleaned_data['description'],
+                'location': form.cleaned_data['location'],
+                'salary_range': form.cleaned_data['salary_range'],
+            }
+            
+            # Initialize Paystack payment
+            headers = {
+                'Authorization': f'Bearer {settings.PAYSTACK_SECRET_KEY}',
+                'Content-Type': 'application/json',
+            }
+            
+            data = {
+                'email': request.POST.get('email'),
+                'amount': 4900 * 100,  # KES 4,900 in cents
+                'currency': 'KES',
+                'callback_url': request.build_absolute_uri(reverse('payment_callback')),
+                'metadata': {
+                    'job_title': form.cleaned_data['title'],
+                    'company': form.cleaned_data['company_name'],
+                }
+            }
+            
+            try:
+                response = requests.post(
+                    'https://api.paystack.co/transaction/initialize',
+                    headers=headers,
+                    json=data,
+                    timeout=30
+                )
+                response_data = response.json()
+                
+                if response_data.get('status'):
+                    return redirect(response_data['data']['authorization_url'])
+                else:
+                    messages.error(request, f"Payment initialization failed: {response_data.get('message')}")
+            except Exception as e:
+                messages.error(request, f"Error: {str(e)}")
+    
+    return redirect('post_job')
+
+
+def payment_callback(request):
+    """Handle Paystack payment callback"""
+    import requests
+    from django.conf import settings
+    from .models import JobListing
+    
+    reference = request.GET.get('reference')
+    
+    if not reference:
+        messages.error(request, "No payment reference found")
+        return redirect('post_job')
+    
+    headers = {'Authorization': f'Bearer {settings.PAYSTACK_SECRET_KEY}'}
+    
+    try:
+        response = requests.get(
+            f'https://api.paystack.co/transaction/verify/{reference}',
+            headers=headers,
+            timeout=30
+        )
+        response_data = response.json()
+        
+        if response_data.get('status') and response_data['data']['status'] == 'success':
+            pending_job = request.session.get('pending_job')
+            if pending_job:
+                # Create the job listing
+                job = JobListing.objects.create(
+                    title=pending_job['title'],
+                    company_name=pending_job['company_name'],
+                    description=pending_job['description'],
+                    location=pending_job['location'],
+                    salary_range=pending_job['salary_range'],
+                    apply_url='#',
+                    is_approved=True,
+                    is_featured=True,
+                )
+                del request.session['pending_job']
+                messages.success(request, f'✅ Payment successful! Your job "{job.title}" is now live!')
+                return redirect('job_detail', job_id=job.id)
+        else:
+            messages.error(request, f"Payment verification failed: {response_data.get('message')}")
+    except Exception as e:
+        messages.error(request, f"Error verifying payment: {str(e)}")
+    
+    return redirect('post_job')
+
+
+@csrf_exempt
+@require_POST
+def paystack_webhook(request):
+    """Handle Paystack payment webhook notifications"""
+    import json
+    try:
+        payload = json.loads(request.body)
+        # Process webhook data here if needed
+        return HttpResponse(status=200)
+    except Exception as e:
+        return HttpResponse(status=400)

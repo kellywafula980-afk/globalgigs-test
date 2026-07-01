@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Applications - {{ job.title }} - GlobalGigs</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-black text-zinc-100 min-h-screen">
+    
+    <header class="border-b border-zinc-800 bg-zinc-950/50 backdrop-blur sticky top-0 z-50">
+        <div class="max-w-5xl mx-auto px-4 h-16 flex items-center justify-between">
+            <a href="/" class="flex items-center gap-2 font-black text-2xl text-white">
+                <span class="text-emerald-500">💼</span> GLOBAL<span class="text-emerald-400">GIGS</span>
+            </a>
+            <div class="flex items-center gap-4">
+                <a href="{% url 'dashboard' %}" class="text-sm text-zinc-400 hover:text-white transition">← Dashboard</a>
+                <a href="{% url 'logout' %}" class="text-sm text-red-400 hover:text-red-300 transition">Logout</a>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-5xl mx-auto px-4 py-8">
+        <h2 class="text-3xl font-black text-white mb-2">📩 Applications for "{{ job.title }}"</h2>
+        <p class="text-zinc-400 mb-8">{{ job.company_name }} • {{ job.location|default:"Remote" }}</p>
+        
+        <!-- Stats -->
+        <div class="grid grid-cols-3 md:grid-cols-6 gap-3 mb-8">
+            <div class="bg-zinc-900/60 border border-zinc-800 rounded-xl p-3 text-center">
+                <p class="text-2xl font-black text-white">{{ total_apps }}</p>
+                <p class="text-zinc-500 text-xs">Total</p>
+            </div>
+            <div class="bg-zinc-900/60 border border-zinc-800 rounded-xl p-3 text-center">
+                <p class="text-2xl font-black text-yellow-400">{{ pending }}</p>
+                <p class="text-zinc-500 text-xs">Pending</p>
+            </div>
+            <div class="bg-zinc-900/60 border border-zinc-800 rounded-xl p-3 text-center">
+                <p class="text-2xl font-black text-blue-400">{{ reviewed }}</p>
+                <p class="text-zinc-500 text-xs">Reviewed</p>
+            </div>
+            <div class="bg-zinc-900/60 border border-zinc-800 rounded-xl p-3 text-center">
+                <p class="text-2xl font-black text-emerald-400">{{ shortlisted }}</p>
+                <p class="text-zinc-500 text-xs">Shortlisted</p>
+            </div>
+            <div class="bg-zinc-900/60 border border-zinc-800 rounded-xl p-3 text-center">
+                <p class="text-2xl font-black text-red-400">{{ rejected }}</p>
+                <p class="text-zinc-500 text-xs">Rejected</p>
+            </div>
+            <div class="bg-zinc-900/60 border border-zinc-800 rounded-xl p-3 text-center">
+                <p class="text-2xl font-black text-green-400">{{ hired }}</p>
+                <p class="text-zinc-500 text-xs">Hired</p>
+            </div>
+        </div>
+        
+        <!-- Applications List -->
+        {% if applications %}
+            <div class="space-y-3">
+                {% for app in applications %}
+                    <div class="p-4 bg-zinc-900/60 border border-zinc-800 rounded-xl hover:border-zinc-700 transition">
+                        <div class="flex flex-wrap items-center justify-between gap-2">
+                            <div class="flex-1">
+                                <p class="text-white font-medium">{{ app.applicant_name }}</p>
+                                <p class="text-zinc-400 text-sm">{{ app.applicant_email }}</p>
+                                <p class="text-zinc-500 text-xs">Applied: {{ app.applied_at|date:"M d, Y g:i A" }}</p>
+                            </div>
+                            <div class="flex items-center gap-3 flex-wrap">
+                                <span class="text-xs px-3 py-1 rounded-full 
+                                    {% if app.status == 'pending' %}bg-yellow-500/20 text-yellow-400 border border-yellow-900/30
+                                    {% elif app.status == 'shortlisted' %}bg-emerald-500/20 text-emerald-400 border border-emerald-900/30
+                                    {% elif app.status == 'rejected' %}bg-red-500/20 text-red-400 border border-red-900/30
+                                    {% elif app.status == 'hired' %}bg-green-500/20 text-green-400 border border-green-900/30
+                                    {% else %}bg-blue-500/20 text-blue-400 border border-blue-900/30{% endif %}">
+                                    {{ app.get_status_display }}
+                                </span>
+                                
+                                <form method="POST" action="{% url 'update_application_status' app.id %}" class="inline">
+                                    {% csrf_token %}
+                                    <select name="status" onchange="this.form.submit()" class="text-xs bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-1 text-white focus:outline-none focus:border-emerald-500">
+                                        <option value="pending" {% if app.status == 'pending' %}selected{% endif %}>⏳ Pending</option>
+                                        <option value="reviewed" {% if app.status == 'reviewed' %}selected{% endif %}>📋 Reviewed</option>
+                                        <option value="shortlisted" {% if app.status == 'shortlisted' %}selected{% endif %}>⭐ Shortlisted</option>
+                                        <option value="rejected" {% if app.status == 'rejected' %}selected{% endif %}>❌ Rejected</option>
+                                        <option value="hired" {% if app.status == 'hired' %}selected{% endif %}>🎉 Hired</option>
+                                    </select>
+                                </form>
+                                
+                                <a href="{% url 'application_detail' app.id %}" class="text-sm bg-zinc-800 hover:bg-zinc-700 text-white px-3 py-1 rounded-lg transition">
+                                    View
+                                </a>
+                            </div>
+                        </div>
+                    </div>
+                {% endfor %}
+            </div>
+        {% else %}
+            <div class="p-16 text-center border-2 border-dashed border-zinc-800 rounded-2xl bg-zinc-950/60">
+                <p class="text-zinc-500 text-lg">No applications yet for this job.</p>
+                <p class="text-zinc-600 text-sm mt-1">Share the job link to start receiving applications.</p>
+            </div>
+        {% endif %}
+        
+        <div class="mt-6">
+            <a href="{% url 'dashboard' %}" class="text-sm text-zinc-400 hover:text-white transition">← Back to Dashboard</a>
+        </div>
+    </main>
+</body>
+</html>
